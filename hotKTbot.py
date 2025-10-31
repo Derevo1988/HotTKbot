@@ -29,10 +29,11 @@ try:
 except ValueError:
     raise ValueError("CHAT_ID должен быть числом")
 
-URL = 'https://www.kino-teatr.ru/mourn/y2025/m10/'
+# URL: страница 12 пагинации (m12) за 2025 год
+URL = 'https://www.kino-teatr.ru/mourn/y2025/m12/'
 STATE_FILE = 'last_obits.json'
 
-# === ЛОГИРОВАНИЕ + СКРЫТИЕ ТОКЕНА ===
+# === ЛОГИРОВАНИЕ ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class NoTokenFilter(logging.Filter):
@@ -52,8 +53,15 @@ logger = logging.getLogger(__name__)
 stats = {
     "checks_last_hour": 0,
     "last_check": None,
-    "start_time": datetime.now().strftime("%H:%M:%S")
+    "start_time": datetime.now()
 }
+
+# Сброс счётчика каждый час
+def reset_hourly():
+    stats["checks_last_hour"] = 0
+    logger.info("Сброс счётчика проверок за час.")
+
+schedule.every().hour.do(reset_hourly)
 
 # === СОСТОЯНИЕ ===
 last_obits = []
@@ -93,7 +101,7 @@ def is_recent(death_date_str):
             day = int(parts[0])
             month_name = parts[1].lower()
             year = int(parts[2])
-            month = months_ru.get(month_name, 10)
+            month = months_ru.get(month_name, 10)  # По умолчанию октябрь
             death_date = datetime(year, month, day)
             return death_date >= datetime.now() - timedelta(hours=24)
     except:
@@ -101,23 +109,28 @@ def is_recent(death_date_str):
     return False
 
 def parse_obits():
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
         response = requests.get(URL, headers=headers, timeout=15)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
 
         obits = []
-        for block in soup.find_all(['h3', 'div', 'p'], string=lambda t: t and ' - ' in t):
-            text = block.get_text(strip=True)
+        # Улучшенный парсинг: ищем блоки с именами (h3/strong) и датами (' - ')
+        entries = soup.find_all(['h3', 'strong', 'div'], class_=['mourning-entry', 'entry']) or soup.find_all(string=lambda t: t and ' - ' in str(t))
+        for entry in entries:
+            text = entry.get_text(strip=True) if entry.name else str(entry).strip()
             if len(text) < 15 or ' - ' not in text:
                 continue
             parts = text.split(' - ', 1)
             name = parts[0].strip()
             dates = parts[1].strip()
-            if any(kw in text.lower() for kw in ['актер', 'артист', 'режиссёр', 'театр', 'гимнаст']):
+            text_lower = text.lower()
+            # Фильтр: только анкеты актеров/артистов
+            if any(kw in text_lower for kw in ['актер', 'артист', 'режиссёр', 'театр', 'гимнаст', 'спорт']):
                 obits.append({'name': name, 'date': dates})
 
+        # Дедупликация + свежие
         seen = set()
         unique = []
         for obit in obits:
@@ -126,10 +139,10 @@ def parse_obits():
                 seen.add(key)
                 unique.append(obit)
 
-        logger.info(f"Найдено {len(unique)} анкет.")
+        logger.info(f"Парсинг страницы 12 (m12): найдено {len(unique)} свежих анкет.")
         return unique
     except Exception as e:
-        logger.error(f"Ошибка парсинга: {e}")
+        logger.error(f"Ошибка парсинга страницы 12 (m12): {e}")
         return []
 
 # === КОМАНДЫ ===
@@ -141,19 +154,24 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_obits = len(last_obits)
     last_check = stats["last_check"] or "ещё не было"
     checks = stats["checks_last_hour"]
-    uptime = (datetime.now() - datetime.strptime(stats["start_time"], "%H:%M:%S").replace(year=datetime.now().year, month=datetime.now().month, day=datetime.now().day)).strftime("%Hч %Mm")
+
+    # Расчёт uptime
+    delta = datetime.now() - stats["start_time"]
+    hours, remainder = divmod(int(delta.total_seconds()), 3600)
+    minutes, _ = divmod(remainder, 60)
+    uptime = f"{hours}ч {minutes}м"
 
     message = f"<b>Статус бота:</b>\n\n"
     message += f"• Всего анкет в базе: <b>{total_obits}</b>\n"
     message += f"• Проверок за час: <b>{checks}</b>\n"
     message += f"• Последняя проверка: <b>{last_check}</b>\n"
     message += f"• Время работы: <b>{uptime}</b>\n"
-    message += f"• Сайт: <a href='{URL}'>Кино-Театр.Ру</a>"
+    message += f"• Мониторит: <a href='{URL}'>Страница 12 (m12)</a>"
 
     await update.message.reply_text(message, parse_mode='HTML', disable_web_page_preview=True)
 
 # === ПРОВЕРКА ОБНОВЛЕНИЙ ===
-async def check_updates():
+async def check_updates(context: ContextTypes.DEFAULT_TYPE):
     stats["checks_last_hour"] += 1
     stats["last_check"] = datetime.now().strftime("%H:%M:%S")
 
@@ -165,10 +183,10 @@ async def check_updates():
     new_obits = [o for o in current_obits if f"{o['name']} {o['date']}" not in last_keys]
 
     if new_obits:
-        message = "Новые анкеты:\n\n"
+        message = "🪦 <b>Новые анкеты на странице 12:</b>\n\n"
         for obit in new_obits:
             message += f"• <b>{obit['name']}</b>\n  {obit['date']}\n\n"
-        message += f"<a href='{URL}'>Источник</a>"
+        message += f"<a href='{URL}'>Подробнее на сайте</a>"
 
         try:
             await context.bot.send_message(
@@ -177,11 +195,13 @@ async def check_updates():
                 parse_mode='HTML',
                 disable_web_page_preview=True
             )
-            logger.info(f"Отправлено: {len(new_obits)}")
+            logger.info(f"Отправлено уведомление: {len(new_obits)} новых анкет на стр. 12.")
         except Exception as e:
             logger.error(f"Ошибка отправки: {e}")
 
         save_state(last_obits + new_obits)
+    else:
+        logger.info("Новых анкет на странице 12 нет.")
 
 # === ФЕЙКОВЫЙ СЕРВЕР ДЛЯ RENDER ===
 class HealthHandler(BaseHTTPRequestHandler):
@@ -189,7 +209,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b'Bot is alive! /ping and /status works.')
+        self.wfile.write(b'Bot is alive! Monitoring page 12 (m12) obituaries.')
 
 def run_server():
     port = int(os.getenv('PORT', 10000))
@@ -201,21 +221,28 @@ threading.Thread(target=run_server, daemon=True).start()
 
 # === ОСНОВНОЙ ЦИКЛ ===
 def main():
-    logger.info("Запуск бота...")
+    logger.info(f"Запуск бота. Мониторим страницу 12 (m12): {URL}")
     load_state()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Инициализация
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("status", status_command))
 
-    def schedule_loop():
-        check = lambda: app.job_queue.run_once(lambda ctx: check_updates(), 0)
-        schedule.every(random.randint(55, 65)).seconds.do(check)
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
+    # Запуск проверки каждую минуту
+    app.job_queue.run_repeating(
+        callback=check_updates,
+        interval=random.randint(55, 65),
+        first=10
+    )
 
-    threading.Thread(target=schedule_loop, daemon=True).start()
+    # Запуск сброса статистики
+    app.job_queue.run_repeating(
+        callback=lambda ctx: schedule.run_pending(),
+        interval=60,
+        first=0
+    )
+
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
