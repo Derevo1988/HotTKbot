@@ -6,9 +6,13 @@ import logging
 from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
-import schedule
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    JobQueue  # ← Добавлено!
+)
 from dotenv import load_dotenv
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -56,13 +60,6 @@ stats = {
     "start_time": datetime.now()
 }
 
-# Сброс счётчика каждый час
-def reset_hourly():
-    stats["checks_last_hour"] = 0
-    logger.info("Сброс счётчика проверок за час.")
-
-schedule.every().hour.do(reset_hourly)
-
 # === СОСТОЯНИЕ ===
 last_obits = []
 
@@ -101,7 +98,7 @@ def is_recent(death_date_str):
             day = int(parts[0])
             month_name = parts[1].lower()
             year = int(parts[2])
-            month = months_ru.get(month_name, 10)  # По умолчанию октябрь
+            month = months_ru.get(month_name, 10)
             death_date = datetime(year, month, day)
             return death_date >= datetime.now() - timedelta(hours=24)
     except:
@@ -116,21 +113,18 @@ def parse_obits():
         soup = BeautifulSoup(response.text, 'html.parser')
 
         obits = []
-        # Улучшенный парсинг: ищем блоки с именами (h3/strong) и датами (' - ')
-        entries = soup.find_all(['h3', 'strong', 'div'], class_=['mourning-entry', 'entry']) or soup.find_all(string=lambda t: t and ' - ' in str(t))
+        entries = soup.find_all(['h3', 'strong', 'div'], string=lambda t: t and ' - ' in str(t))
         for entry in entries:
-            text = entry.get_text(strip=True) if entry.name else str(entry).strip()
+            text = entry.get_text(strip=True)
             if len(text) < 15 or ' - ' not in text:
                 continue
             parts = text.split(' - ', 1)
             name = parts[0].strip()
             dates = parts[1].strip()
             text_lower = text.lower()
-            # Фильтр: только анкеты актеров/артистов
             if any(kw in text_lower for kw in ['актер', 'артист', 'режиссёр', 'театр', 'гимнаст', 'спорт']):
                 obits.append({'name': name, 'date': dates})
 
-        # Дедупликация + свежие
         seen = set()
         unique = []
         for obit in obits:
@@ -139,10 +133,10 @@ def parse_obits():
                 seen.add(key)
                 unique.append(obit)
 
-        logger.info(f"Парсинг страницы 12 (m12): найдено {len(unique)} свежих анкет.")
+        logger.info(f"Парсинг m12: найдено {len(unique)} свежих анкет.")
         return unique
     except Exception as e:
-        logger.error(f"Ошибка парсинга страницы 12 (m12): {e}")
+        logger.error(f"Ошибка парсинга m12: {e}")
         return []
 
 # === КОМАНДЫ ===
@@ -155,7 +149,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_check = stats["last_check"] or "ещё не было"
     checks = stats["checks_last_hour"]
 
-    # Расчёт uptime
     delta = datetime.now() - stats["start_time"]
     hours, remainder = divmod(int(delta.total_seconds()), 3600)
     minutes, _ = divmod(remainder, 60)
@@ -183,10 +176,10 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
     new_obits = [o for o in current_obits if f"{o['name']} {o['date']}" not in last_keys]
 
     if new_obits:
-        message = "🪦 <b>Новые анкеты на странице 12:</b>\n\n"
+        message = "Новые анкеты на странице 12:\n\n"
         for obit in new_obits:
             message += f"• <b>{obit['name']}</b>\n  {obit['date']}\n\n"
-        message += f"<a href='{URL}'>Подробнее на сайте</a>"
+        message += f"<a href='{URL}'>Подробнее</a>"
 
         try:
             await context.bot.send_message(
@@ -195,13 +188,16 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='HTML',
                 disable_web_page_preview=True
             )
-            logger.info(f"Отправлено уведомление: {len(new_obits)} новых анкет на стр. 12.")
+            logger.info(f"Отправлено: {len(new_obits)} новых анкет.")
         except Exception as e:
             logger.error(f"Ошибка отправки: {e}")
 
         save_state(last_obits + new_obits)
-    else:
-        logger.info("Новых анкет на странице 12 нет.")
+
+# === СБРОС СТАТИСТИКИ ===
+def reset_hourly(context: ContextTypes.DEFAULT_TYPE):
+    stats["checks_last_hour"] = 0
+    logger.info("Сброс счётчика проверок за час.")
 
 # === ФЕЙКОВЫЙ СЕРВЕР ДЛЯ RENDER ===
 class HealthHandler(BaseHTTPRequestHandler):
@@ -209,7 +205,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b'Bot is alive! Monitoring page 12 (m12) obituaries.')
+        self.wfile.write(b'Bot is alive! Monitoring m12.')
 
 def run_server():
     port = int(os.getenv('PORT', 10000))
@@ -221,26 +217,26 @@ threading.Thread(target=run_server, daemon=True).start()
 
 # === ОСНОВНОЙ ЦИКЛ ===
 def main():
-    logger.info(f"Запуск бота. Мониторим страницу 12 (m12): {URL}")
+    logger.info(f"Запуск бота. Мониторим: {URL}")
     load_state()
 
-    # Инициализация
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    # ВКЛЮЧАЕМ JOB_QUEUE!
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).job_queue(JobQueue()).build()
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("status", status_command))
 
-    # Запуск проверки каждую минуту
+    # Проверка каждую минуту
     app.job_queue.run_repeating(
         callback=check_updates,
         interval=random.randint(55, 65),
         first=10
     )
 
-    # Запуск сброса статистики
+    # Сброс статистики каждый час
     app.job_queue.run_repeating(
-        callback=lambda ctx: schedule.run_pending(),
-        interval=60,
-        first=0
+        callback=reset_hourly,
+        interval=3600,
+        first=3600
     )
 
     app.run_polling(drop_pending_updates=True)
