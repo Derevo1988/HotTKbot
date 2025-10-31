@@ -10,31 +10,31 @@ import schedule
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Загружаем .env
+# === ЗАГРУЗКА .env ===
 load_dotenv()
 
-# === НАСТРОЙКИ ИЗ .env ===
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не найден! Установите его в .env")
+    raise ValueError("BOT_TOKEN не найден!")
 if not CHAT_ID:
-    raise ValueError("CHAT_ID не найден! Установите его в .env")
+    raise ValueError("CHAT_ID не найден!")
 
 try:
     CHAT_ID = int(CHAT_ID)
 except ValueError:
-    raise ValueError("CHAT_ID должен быть числом (например, -1001234567890)")
+    raise ValueError("CHAT_ID должен быть числом")
 
-URL = 'https://www.kino-teatr.ru/mourn/y2025/m12/'
+URL = 'https://www.kino-teatr.ru/mourn/y2025/m10/'
 STATE_FILE = 'last_obits.json'
 
 # === ЛОГИРОВАНИЕ + СКРЫТИЕ ТОКЕНА ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Фильтр: скрываем токен в логах
 class NoTokenFilter(logging.Filter):
     def filter(self, record):
         msg = record.getMessage()
@@ -44,18 +44,20 @@ class NoTokenFilter(logging.Filter):
                 record.msg = msg.replace(parts[1].strip(), "HIDDEN_TOKEN")
         return True
 
-# Применяем фильтр ко всем логам
 logging.getLogger().addFilter(NoTokenFilter())
-
-# Убираем спам от HTTP-запросов (getUpdates)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
-# Глобальное состояние
+# === СТАТИСТИКА ===
+stats = {
+    "checks_last_hour": 0,
+    "last_check": None,
+    "start_time": datetime.now().strftime("%H:%M:%S")
+}
+
+# === СОСТОЯНИЕ ===
 last_obits = []
 
-# === ФУНКЦИИ ПАРСИНГА ===
 def load_state():
     global last_obits
     try:
@@ -64,10 +66,9 @@ def load_state():
             last_obits = data
             return data
     except FileNotFoundError:
-        logger.info("Файл состояния не найден — начинаем с нуля.")
         return []
     except Exception as e:
-        logger.error(f"Ошибка чтения состояния: {e}")
+        logger.error(f"Ошибка чтения: {e}")
         return last_obits
 
 def save_state(obits):
@@ -76,9 +77,8 @@ def save_state(obits):
     try:
         with open(STATE_FILE, 'w', encoding='utf-8') as f:
             json.dump(obits, f, ensure_ascii=False, indent=2)
-        logger.info("Состояние сохранено.")
     except Exception as e:
-        logger.warning(f"Не удалось сохранить: {e}")
+        logger.warning(f"Не сохранилось: {e}")
 
 def is_recent(death_date_str):
     try:
@@ -126,20 +126,37 @@ def parse_obits():
                 seen.add(key)
                 unique.append(obit)
 
-        logger.info(f"Найдено {len(unique)} свежих анкет.")
+        logger.info(f"Найдено {len(unique)} анкет.")
         return unique
     except Exception as e:
         logger.error(f"Ошибка парсинга: {e}")
         return []
 
-# === КОМАНДА /ping ===
+# === КОМАНДЫ ===
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ответ на /ping"""
     now = datetime.now().strftime("%H:%M:%S")
-    await update.message.reply_text(f"Pong! Бот работает.\nВремя: {now}")
+    await update.message.reply_text(f"Pong! Бот жив.\nВремя: {now}")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total_obits = len(last_obits)
+    last_check = stats["last_check"] or "ещё не было"
+    checks = stats["checks_last_hour"]
+    uptime = (datetime.now() - datetime.strptime(stats["start_time"], "%H:%M:%S").replace(year=datetime.now().year, month=datetime.now().month, day=datetime.now().day)).strftime("%Hч %Mm")
+
+    message = f"<b>Статус бота:</b>\n\n"
+    message += f"• Всего анкет в базе: <b>{total_obits}</b>\n"
+    message += f"• Проверок за час: <b>{checks}</b>\n"
+    message += f"• Последняя проверка: <b>{last_check}</b>\n"
+    message += f"• Время работы: <b>{uptime}</b>\n"
+    message += f"• Сайт: <a href='{URL}'>Кино-Театр.Ру</a>"
+
+    await update.message.reply_text(message, parse_mode='HTML', disable_web_page_preview=True)
 
 # === ПРОВЕРКА ОБНОВЛЕНИЙ ===
 async def check_updates():
+    stats["checks_last_hour"] += 1
+    stats["last_check"] = datetime.now().strftime("%H:%M:%S")
+
     current_obits = parse_obits()
     if not current_obits:
         return
@@ -148,10 +165,10 @@ async def check_updates():
     new_obits = [o for o in current_obits if f"{o['name']} {o['date']}" not in last_keys]
 
     if new_obits:
-        message = "Новые анкеты на Кино-Театр.Ру:\n\n"
+        message = "Новые анкеты:\n\n"
         for obit in new_obits:
             message += f"• <b>{obit['name']}</b>\n  {obit['date']}\n\n"
-        message += f"<a href='{URL}'>Перейти</a>"
+        message += f"<a href='{URL}'>Источник</a>"
 
         try:
             await context.bot.send_message(
@@ -160,63 +177,46 @@ async def check_updates():
                 parse_mode='HTML',
                 disable_web_page_preview=True
             )
-            logger.info(f"Отправлено: {len(new_obits)} анкет.")
+            logger.info(f"Отправлено: {len(new_obits)}")
         except Exception as e:
             logger.error(f"Ошибка отправки: {e}")
 
         save_state(last_obits + new_obits)
-    else:
-        logger.info("Новых анкет нет.")
+
+# === ФЕЙКОВЫЙ СЕРВЕР ДЛЯ RENDER ===
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is alive! /ping and /status works.')
+
+def run_server():
+    port = int(os.getenv('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f"Фейковый сервер запущен на порту {port}")
+    server.serve_forever()
+
+threading.Thread(target=run_server, daemon=True).start()
 
 # === ОСНОВНОЙ ЦИКЛ ===
 def main():
     logger.info("Запуск бота...")
     load_state()
 
-    # Создаём приложение
-    application = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("ping", ping_command))
+    app.add_handler(CommandHandler("status", status_command))
 
-    # Добавляем команду /ping
-    application.add_handler(CommandHandler("ping", ping_command))
-
-    # Запускаем polling (для получения команд)
-    application.run_polling(drop_pending_updates=True)
-
-    # === ФОНОВАЯ ПРОВЕРКА КАЖДУЮ МИНУТУ ===
-    # Отдельный поток для schedule
     def schedule_loop():
-        check_updates_sync = lambda: application.job_queue.run_once(
-            lambda ctx: check_updates(), 0
-        )
-        schedule.every(random.randint(55, 65)).seconds.do(check_updates_sync)
+        check = lambda: app.job_queue.run_once(lambda ctx: check_updates(), 0)
+        schedule.every(random.randint(55, 65)).seconds.do(check)
         while True:
             schedule.run_pending()
             time.sleep(1)
 
-    import threading
     threading.Thread(target=schedule_loop, daemon=True).start()
-
-    # === ФЕЙКОВЫЙ СЕРВЕР ДЛЯ RENDER (открывает порт) ===
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import os
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b'Bot is alive! /ping works.')
-
-def run_server():
-    port = int(os.getenv('PORT', 10000))  # Render использует $PORT
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    logger.info(f"Фейковый сервер запущен на порту {port}")
-    server.serve_forever()
-
-# Запускаем сервер в отдельном потоке
-threading.Thread(target=run_server, daemon=True).start()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
-
     main()
