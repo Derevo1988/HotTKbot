@@ -196,5 +196,27 @@ def main():
     import threading
     threading.Thread(target=schedule_loop, daemon=True).start()
 
+    # === ФЕЙКОВЫЙ СЕРВЕР ДЛЯ RENDER (открывает порт) ===
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is alive! /ping works.')
+
+def run_server():
+    port = int(os.getenv('PORT', 10000))  # Render использует $PORT
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f"Фейковый сервер запущен на порту {port}")
+    server.serve_forever()
+
+# Запускаем сервер в отдельном потоке
+threading.Thread(target=run_server, daemon=True).start()
+
 if __name__ == '__main__':
+
     main()
