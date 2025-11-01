@@ -55,10 +55,13 @@ def load_state():
         with open(STATE_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
             last_obits = data
+        logger.info(f"Загружено {len(last_obits)} анкет из файла состояния")
     except FileNotFoundError:
-        pass
+        logger.info("Файл состояния не найден, начинаем с чистого листа")
+        last_obits = []
     except Exception as e:
-        logger.error(f"Ошибка чтения: {e}")
+        logger.error(f"Ошибка чтения файла состояния: {e}")
+        last_obits = []
 
 def save_state(obits):
     global last_obits
@@ -66,8 +69,9 @@ def save_state(obits):
     try:
         with open(STATE_FILE, 'w', encoding='utf-8') as f:
             json.dump(obits, f, ensure_ascii=False, indent=2)
+        logger.info(f"Сохранено {len(obits)} анкет в файл состояния")
     except Exception as e:
-        logger.warning(f"Не сохранилось: {e}")
+        logger.error(f"Ошибка сохранения состояния: {e}")
 
 def is_recent(death_date_str):
     try:
@@ -77,50 +81,95 @@ def is_recent(death_date_str):
         }
         if ' - ' in death_date_str:
             death_date_str = death_date_str.split(' - ')[-1].strip()
+        
         parts = death_date_str.split()
         if len(parts) >= 3:
             day = int(parts[0])
             month_name = parts[1].lower()
             year = int(parts[2])
-            month = months_ru.get(month_name, 10)
+            month = months_ru.get(month_name)
+            
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: проверка на None
+            if month is None:
+                return False
+                
             death_date = datetime(year, month, day)
             return death_date >= datetime.now() - timedelta(hours=24)
-    except:
         return False
-    return False
+    except Exception as e:
+        logger.warning(f"Ошибка в is_recent для '{death_date_str}': {e}")
+        return False
 
 def parse_obits():
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+    
     try:
-        response = requests.get(URL, headers=headers, timeout=15)
+        # Таймауты для избежания зависаний
+        logger.info("Начало парсинга страницы...")
+        response = requests.get(URL, headers=headers, timeout=(10, 15))
         response.raise_for_status()
+        
+        # Проверка на блокировку
+        if any(blocked in response.text.lower() for blocked in ['cloudflare', 'access denied', 'доступ запрещен']):
+            logger.warning("Обнаружена блокировка Cloudflare или аналогичная")
+            return []
+            
         soup = BeautifulSoup(response.text, 'html.parser')
 
         obits = []
-        entries = soup.find_all(['h3', 'strong', 'div'], string=lambda t: t and ' - ' in str(t))
-        for entry in entries:
-            text = entry.get_text(strip=True)
-            if len(text) < 15 or ' - ' not in text:
-                continue
-            parts = text.split(' - ', 1)
-            name = parts[0].strip()
-            dates = parts[1].strip()
-            text_lower = text.lower()
-            if any(kw in text_lower for kw in ['актер', 'артист', 'режиссёр', 'театр', 'гимнаст', 'спорт']):
-                obits.append({'name': name, 'date': dates})
+        
+        # Более специфичные селекторы
+        possible_selectors = [
+            'h3', 'strong', 'div.text_block', 'div.content_block',
+            '.news_text', '.article_text', 'p'
+        ]
+        
+        for selector in possible_selectors:
+            entries = soup.select(selector)
+            for entry in entries:
+                text = entry.get_text(strip=True)
+                if not text or ' - ' not in text or len(text) < 15:
+                    continue
+                    
+                # Более надежное разделение
+                if ' - ' in text:
+                    parts = text.split(' - ', 1)
+                    if len(parts) == 2:
+                        name = parts[0].strip()
+                        dates = parts[1].strip()
+                        
+                        text_lower = text.lower()
+                        if any(kw in text_lower for kw in ['актер', 'артист', 'режиссёр', 'театр', 'гимнаст', 'спорт', 'кино']):
+                            if is_recent(dates):  # Проверяем ДО добавления
+                                obits.append({'name': name, 'date': dates})
 
+        # Убираем дубликаты
         seen = set()
         unique = []
         for obit in obits:
             key = f"{obit['name']} {obit['date']}"
-            if key not in seen and is_recent(obit['date']):
+            if key not in seen:
                 seen.add(key)
                 unique.append(obit)
 
-        logger.info(f"Парсинг m12: найдено {len(unique)} свежих анкет.")
+        logger.info(f"Парсинг завершен: найдено {len(unique)} свежих анкет.")
         return unique
+        
+    except requests.exceptions.Timeout:
+        logger.error("Таймаут при запросе к сайту")
+        return []
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Ошибка сети: {e}")
+        return []
     except Exception as e:
-        logger.error(f"Ошибка парсинга: {e}")
+        logger.error(f"Неожиданная ошибка парсинга: {e}")
         return []
 
 # === УВЕДОМЛЕНИЕ ПРИ ЗАПУСКЕ ===
@@ -163,9 +212,11 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
         stats["checks_last_hour"] += 1
         stats["last_check"] = datetime.now().strftime("%H:%M:%S")
 
+        logger.info(f"Начало проверки #{stats['checks_last_hour']}")
         current_obits = parse_obits()
-        if not current_obits:
-            return
+        
+        if current_obits is None:  # На случай если parse_obits вернет None
+            current_obits = []
 
         last_keys = {f"{o['name']} {o['date']}" for o in last_obits}
         new_obits = [o for o in current_obits if f"{o['name']} {o['date']}" not in last_keys]
@@ -182,10 +233,15 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='HTML',
                 disable_web_page_preview=True
             )
-            logger.info(f"Отправлено: {len(new_obits)} новых анкет.")
+            logger.info(f"Отправлено {len(new_obits)} новых анкет.")
+            
+            # Обновляем состояние
             save_state(last_obits + new_obits)
+        else:
+            logger.info("Новых анкет не найдено")
+            
     except Exception as e:
-        logger.error(f"Ошибка в check_updates: {e}")
+        logger.error(f"Ошибка в check_updates: {e}", exc_info=True)
 
 # === СБРОС СТАТИСТИКИ ===
 async def reset_hourly(context: ContextTypes.DEFAULT_TYPE):
@@ -199,6 +255,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
         self.wfile.write(b'Bot is alive!')
+    
+    def log_message(self, format, *args):
+        # Отключаем стандартное логирование HTTP-запросов
+        return
 
 def run_server():
     port = int(os.getenv('PORT', 10000))
@@ -217,25 +277,38 @@ def main():
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("status", status_command))
 
-    # Уведомление при запуске (стабильно)
+    # Уведомление при запуске
     app.job_queue.run_once(startup_notification, when=10)
 
-    # Проверка каждую минуту
-    app.job_queue.run_repeating(check_updates, interval=random.randint(55, 65), first=15)
+    # Проверка с более безопасными интервалами
+    app.job_queue.run_repeating(check_updates, interval=60, first=15)  # Фиксированный интервал
 
     # Сброс статистики
     app.job_queue.run_repeating(reset_hourly, interval=3600, first=3600)
 
     try:
-        app.run_polling(drop_pending_updates=True)
+        logger.info("Бот начал работу (polling)...")
+        app.run_polling(
+            drop_pending_updates=True,
+            close_loop=False,  # Для лучшего контроля
+            stop_signals=None  # Отключаем стандартные сигналы
+        )
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
     except Exception as e:
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
-        # Отправляем ошибку в чат
+        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: {e}", exc_info=True)
         try:
-            app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+            # Асинхронная отправка ошибки
+            import asyncio
+            asyncio.run(app.bot.send_message(
+                chat_id=CHAT_ID, 
+                text=f"🔴 Бот упал с ошибкой: {str(e)[:100]}..."
+            ))
         except:
             pass
         raise
+    finally:
+        logger.info("Бот завершил работу")
 
 if __name__ == '__main__':
     main()
