@@ -11,13 +11,13 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    JobQueue  # ← Добавлено!
+    JobQueue
 )
 from dotenv import load_dotenv
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# === ЗАГРУЗКА .env ===
+# === ЗАГРУЗКА .env (или из Render) ===
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -33,24 +33,11 @@ try:
 except ValueError:
     raise ValueError("CHAT_ID должен быть числом")
 
-# URL: страница 12 пагинации (m12) за 2025 год
 URL = 'https://www.kino-teatr.ru/mourn/y2025/m12/'
 STATE_FILE = 'last_obits.json'
 
 # === ЛОГИРОВАНИЕ ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-class NoTokenFilter(logging.Filter):
-    def filter(self, record):
-        msg = record.getMessage()
-        if "bot" in msg and ":" in msg:
-            parts = msg.split(":", 1)
-            if len(parts) > 1 and len(parts[1].strip()) > 10:
-                record.msg = msg.replace(parts[1].strip(), "HIDDEN_TOKEN")
-        return True
-
-logging.getLogger().addFilter(NoTokenFilter())
-logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # === СТАТИСТИКА ===
@@ -106,7 +93,7 @@ def is_recent(death_date_str):
     return False
 
 def parse_obits():
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         response = requests.get(URL, headers=headers, timeout=15)
         response.raise_for_status()
@@ -136,8 +123,28 @@ def parse_obits():
         logger.info(f"Парсинг m12: найдено {len(unique)} свежих анкет.")
         return unique
     except Exception as e:
-        logger.error(f"Ошибка парсинга m12: {e}")
+        logger.error(f"Ошибка парсинга: {e}")
         return []
+
+# === УВЕДОМЛЕНИЕ ПРИ ЗАПУСКЕ ===
+async def send_startup_message(app):
+    await asyncio.sleep(5)  # Ждём, пока всё загрузится
+    try:
+        now = datetime.now().strftime("%H:%M:%S")
+        message = (
+            "Бот перезапущен и работает!\n"
+            f"Время: {now}\n"
+            f"Мониторит: <a href='{URL}'>Страница 12 (m12)</a>"
+        )
+        await app.bot.send_message(
+            chat_id=CHAT_ID,
+            text=message,
+            parse_mode='HTML',
+            disable_web_page_preview=True
+        )
+        logger.info("Уведомление о запуске отправлено.")
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление: {e}")
 
 # === КОМАНДЫ ===
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,13 +206,13 @@ def reset_hourly(context: ContextTypes.DEFAULT_TYPE):
     stats["checks_last_hour"] = 0
     logger.info("Сброс счётчика проверок за час.")
 
-# === ФЕЙКОВЫЙ СЕРВЕР ДЛЯ RENDER ===
+# === ФЕЙКОВЫЙ СЕРВЕР ===
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b'Bot is alive! Monitoring m12.')
+        self.wfile.write(b'Bot is alive!')
 
 def run_server():
     port = int(os.getenv('PORT', 10000))
@@ -216,14 +223,21 @@ def run_server():
 threading.Thread(target=run_server, daemon=True).start()
 
 # === ОСНОВНОЙ ЦИКЛ ===
+import asyncio
+
 def main():
     logger.info(f"Запуск бота. Мониторим: {URL}")
     load_state()
 
-    # ВКЛЮЧАЕМ JOB_QUEUE!
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).job_queue(JobQueue()).build()
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("status", status_command))
+
+    # Уведомление при запуске
+    app.job_queue.run_once(
+        callback=lambda ctx: asyncio.create_task(send_startup_message(app)),
+        when=5
+    )
 
     # Проверка каждую минуту
     app.job_queue.run_repeating(
