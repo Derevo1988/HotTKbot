@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# === ЗАГРУЗКА .env (или из Render) ===
+# === ЗАГРУЗКА ===
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -36,7 +36,7 @@ except ValueError:
 URL = 'https://www.kino-teatr.ru/mourn/y2025/m12/'
 STATE_FILE = 'last_obits.json'
 
-# === ЛОГИРОВАНИЕ ===
+# === ЛОГИ ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,6 @@ stats = {
     "start_time": datetime.now()
 }
 
-# === СОСТОЯНИЕ ===
 last_obits = []
 
 def load_state():
@@ -56,12 +55,10 @@ def load_state():
         with open(STATE_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
             last_obits = data
-            return data
     except FileNotFoundError:
-        return []
+        pass
     except Exception as e:
         logger.error(f"Ошибка чтения: {e}")
-        return last_obits
 
 def save_state(obits):
     global last_obits
@@ -126,17 +123,16 @@ def parse_obits():
         logger.error(f"Ошибка парсинга: {e}")
         return []
 
-# === УВЕДОМЛЕНИЕ ПРИ ЗАПУСКЕ ===
-async def send_startup_message(app):
-    await asyncio.sleep(5)  # Ждём, пока всё загрузится
+# === УВЕДОМЛЕНИЕ ПРИ ЗАПУСКЕ (БЕЗ ОШИБОК) ===
+async def startup_notification(context: ContextTypes.DEFAULT_TYPE):
     try:
         now = datetime.now().strftime("%H:%M:%S")
         message = (
-            "Бот перезапущен и работает!\n"
+            "Бот запущен и работает!\n"
             f"Время: {now}\n"
             f"Мониторит: <a href='{URL}'>Страница 12 (m12)</a>"
         )
-        await app.bot.send_message(
+        await context.bot.send_message(
             chat_id=CHAT_ID,
             text=message,
             parse_mode='HTML',
@@ -223,37 +219,28 @@ def run_server():
 threading.Thread(target=run_server, daemon=True).start()
 
 # === ОСНОВНОЙ ЦИКЛ ===
-import asyncio
-
 def main():
-    logger.info(f"Запуск бота. Мониторим: {URL}")
+    logger.info("Запуск бота...")
     load_state()
 
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).job_queue(JobQueue()).build()
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("status", status_command))
 
-    # Уведомление при запуске
-    app.job_queue.run_once(
-        callback=lambda ctx: asyncio.create_task(send_startup_message(app)),
-        when=5
-    )
+    # Уведомление при запуске — БЕЗ ОШИБОК
+    app.job_queue.run_once(startup_notification, when=10)
 
     # Проверка каждую минуту
-    app.job_queue.run_repeating(
-        callback=check_updates,
-        interval=random.randint(55, 65),
-        first=10
-    )
+    app.job_queue.run_repeating(check_updates, interval=random.randint(55, 65), first=15)
 
-    # Сброс статистики каждый час
-    app.job_queue.run_repeating(
-        callback=reset_hourly,
-        interval=3600,
-        first=3600
-    )
+    # Сброс статистики
+    app.job_queue.run_repeating(reset_hourly, interval=3600, first=3600)
 
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        raise
 
 if __name__ == '__main__':
     main()
