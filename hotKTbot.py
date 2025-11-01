@@ -123,21 +123,12 @@ def parse_obits():
         logger.error(f"Ошибка парсинга: {e}")
         return []
 
-# === УВЕДОМЛЕНИЕ ПРИ ЗАПУСКЕ (БЕЗ ОШИБОК) ===
+# === УВЕДОМЛЕНИЕ ПРИ ЗАПУСКЕ ===
 async def startup_notification(context: ContextTypes.DEFAULT_TYPE):
     try:
         now = datetime.now().strftime("%H:%M:%S")
-        message = (
-            "Бот запущен и работает!\n"
-            f"Время: {now}\n"
-            f"Мониторит: <a href='{URL}'>Страница 12 (m12)</a>"
-        )
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=message,
-            parse_mode='HTML',
-            disable_web_page_preview=True
-        )
+        message = f"🟢 Бот запущен и работает!\nВремя: {now}\nМониторит: <a href='{URL}'>Страница 12 (m12)</a>"
+        await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
         logger.info("Уведомление о запуске отправлено.")
     except Exception as e:
         logger.error(f"Не удалось отправить уведомление: {e}")
@@ -145,7 +136,7 @@ async def startup_notification(context: ContextTypes.DEFAULT_TYPE):
 # === КОМАНДЫ ===
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now().strftime("%H:%M:%S")
-    await update.message.reply_text(f"Pong! Бот жив.\nВремя: {now}")
+    await update.message.reply_text(f"🟢 Pong! Бот жив.\nВремя: {now}")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_obits = len(last_obits)
@@ -168,23 +159,23 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ПРОВЕРКА ОБНОВЛЕНИЙ ===
 async def check_updates(context: ContextTypes.DEFAULT_TYPE):
-    stats["checks_last_hour"] += 1
-    stats["last_check"] = datetime.now().strftime("%H:%M:%S")
+    try:
+        stats["checks_last_hour"] += 1
+        stats["last_check"] = datetime.now().strftime("%H:%M:%S")
 
-    current_obits = parse_obits()
-    if not current_obits:
-        return
+        current_obits = parse_obits()
+        if not current_obits:
+            return
 
-    last_keys = {f"{o['name']} {o['date']}" for o in last_obits}
-    new_obits = [o for o in current_obits if f"{o['name']} {o['date']}" not in last_keys]
+        last_keys = {f"{o['name']} {o['date']}" for o in last_obits}
+        new_obits = [o for o in current_obits if f"{o['name']} {o['date']}" not in last_keys]
 
-    if new_obits:
-        message = "Новые анкеты на странице 12:\n\n"
-        for obit in new_obits:
-            message += f"• <b>{obit['name']}</b>\n  {obit['date']}\n\n"
-        message += f"<a href='{URL}'>Подробнее</a>"
+        if new_obits:
+            message = "🪦 <b>Новые анкеты на странице 12:</b>\n\n"
+            for obit in new_obits:
+                message += f"• <b>{obit['name']}</b>\n  {obit['date']}\n\n"
+            message += f"<a href='{URL}'>Подробнее</a>"
 
-        try:
             await context.bot.send_message(
                 chat_id=CHAT_ID,
                 text=message,
@@ -192,13 +183,12 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
             logger.info(f"Отправлено: {len(new_obits)} новых анкет.")
-        except Exception as e:
-            logger.error(f"Ошибка отправки: {e}")
-
-        save_state(last_obits + new_obits)
+            save_state(last_obits + new_obits)
+    except Exception as e:
+        logger.error(f"Ошибка в check_updates: {e}")
 
 # === СБРОС СТАТИСТИКИ ===
-def reset_hourly(context: ContextTypes.DEFAULT_TYPE):
+async def reset_hourly(context: ContextTypes.DEFAULT_TYPE):
     stats["checks_last_hour"] = 0
     logger.info("Сброс счётчика проверок за час.")
 
@@ -227,7 +217,7 @@ def main():
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("status", status_command))
 
-    # Уведомление при запуске — БЕЗ ОШИБОК
+    # Уведомление при запуске (стабильно)
     app.job_queue.run_once(startup_notification, when=10)
 
     # Проверка каждую минуту
@@ -240,6 +230,11 @@ def main():
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
         logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        # Отправляем ошибку в чат
+        try:
+            app.bot.send_message(chat_id=CHAT_ID, text=f"🔴 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        except:
+            pass
         raise
 
 if __name__ == '__main__':
